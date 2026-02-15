@@ -1,0 +1,11 @@
+// Config が読み込まれているか確認
+console.log('Config:', window.INVENTORY_CONFIG);
+
+// App ID を確認
+console.log('App IDs:', window.INVENTORY_CONFIG.APP_IDS);
+
+// フィールド定義を確認
+console.log('Transaction Fields:', window.INVENTORY_CONFIG.FIELDS.TRANSACTION);
+
+// バージョン確認
+console.log('Version:', window.INVENTORY_CONFIG.VERSION);
