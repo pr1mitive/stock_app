@@ -3,9 +3,9 @@
  * 
  * App ID、フィールド名、定数などを一元管理
  * 
- * @version 2.0.1
+ * @version 2.0.4
  * @date 2026-02-15
- * @update 倉庫マスタ対応追加
+ * @update 発注明細テーブル対応
  */
 
 (function(PLUGIN_ID) {
@@ -69,7 +69,10 @@
     // その他
     REMARKS: 'remarks',
     CREATED_BY: 'created_by',
-    UPDATED_AT: 'updated_at'
+    UPDATED_AT: 'updated_at',
+    
+    // 一括更新用
+    PROCESSED_FLAG: 'processed_flag'  // 処理フラグ（チェックボックス）
   };
 
   // 在庫残高アプリ
@@ -167,10 +170,38 @@
 
   // 発注管理アプリ
   const PO_FIELDS = {
+    // ヘッダー情報
     PO_NUMBER: 'po_number',
+    ORDER_DATE: 'order_date',
+    SUPPLIER: 'supplier',
+    
+    // 発注明細テーブル（po_items）
+    PO_ITEMS: 'po_items',  // テーブルフィールドコード
+    
+    // 旧フィールド（互換性保持）
     IS_RECEIVED: 'is_received',
     RECEIVED_DATE: 'received_date',
-    EXPECTED_RECEIVED_DATE: 'expected_received_date'
+    EXPECTED_RECEIVED_DATE: 'expected_received_date',
+    LAST_RECEIVED_DATE: 'last_received_date'
+  };
+
+  // 発注明細テーブル（po_items）のフィールド
+  const PO_ITEM_FIELDS = {
+    // 基本情報
+    ITEM_CODE: 'item_code',
+    ITEM_NAME: 'item_name',
+    
+    // 数量管理
+    QUANTITY: 'quantity',                // 発注数
+    RECEIVED_QTY: 'received_qty',        // 納品済数（自動計算）
+    REMAINING_QTY: 'remaining_qty',      // 発注残数（自動計算）
+    
+    // ステータス
+    DELIVERY_STATUS: 'delivery_status',  // 納品ステータス（未納品/一部納品/完納）
+    
+    // 金額
+    UNIT_PRICE: 'unit_price',
+    AMOUNT: 'amount'
   };
 
   // =====================================================
@@ -231,6 +262,14 @@
     NOT_RECEIVED: '未入庫',
     PARTIAL: '一部入庫',
     COMPLETED: '入庫完了'
+  };
+
+  // 納品ステータス（発注管理用）
+  const DELIVERY_STATUSES = {
+    NOT_DELIVERED: '未納品',       // received_qty = 0
+    PARTIAL: '一部納品',           // 0 < received_qty < ordered_qty
+    COMPLETED: '完納',              // received_qty = ordered_qty
+    OVER_DELIVERED: '過納品'        // received_qty > ordered_qty
   };
 
   // 原価計算方法
@@ -313,7 +352,8 @@
       PROJECTION: PROJECTION_FIELDS,
       ITEM_MASTER: ITEM_MASTER_FIELDS,
       WAREHOUSE_MASTER: WAREHOUSE_MASTER_FIELDS,  // 追加
-      PO: PO_FIELDS
+      PO: PO_FIELDS,
+      PO_ITEM: PO_ITEM_FIELDS  // 発注明細テーブル用を追加
     },
     TRANSACTION_TYPES: TRANSACTION_TYPES,
     STATUSES: STATUSES,
@@ -322,6 +362,7 @@
     ALERT_FLAGS: ALERT_FLAGS,
     INVENTORY_TYPES: INVENTORY_TYPES,
     RECEIVED_STATUSES: RECEIVED_STATUSES,
+    DELIVERY_STATUSES: DELIVERY_STATUSES,  // 発注管理用を追加
     COST_METHODS: COST_METHODS,
     UI: UI,
     
