@@ -473,6 +473,15 @@
     console.warn(`[INVENTORY] ${message}`, data !== undefined ? data : '');
   }
 
+  /**
+   * 指定ミリ秒待機（非同期）
+   * @param {number} ms - 待機時間（ミリ秒）
+   * @returns {Promise} Promise
+   */
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   // =====================================================
   // バリデーション
   // =====================================================
@@ -559,7 +568,10 @@
     isRequired: isRequired,
     isNumber: isNumber,
     isDate: isDate,
-    isPositive: isPositive
+    isPositive: isPositive,
+    
+    // 非同期処理
+    sleep: sleep
   };
 
   window.InventoryUtils.VERSION = '2.0';
