@@ -1,2 +1,4 @@
-console.log('Config:', window.INVENTORY_CONFIG);
-console.log('Utils:', window.InventoryUtils);
+console.log('1. Config:', typeof window.INVENTORY_CONFIG);
+console.log('2. Utils:', typeof window.InventoryUtils);
+console.log('3. ID Generator:', typeof window.InventoryIdGenerator);
+console.log('4. Update:', typeof window.InventoryUpdate);
