@@ -134,7 +134,7 @@
   /**
    * 在庫残高を更新
    */
-  async function updateInventoryBalance(transactionRecord) {
+  async function updateInventoryBalance(transactionRecord, transactionRecordId = null) {
     const itemCode = Utils.getFieldValue(transactionRecord, CONFIG.FIELDS.TRANSACTION.ITEM_CODE);
     const warehouse = Utils.getFieldValue(transactionRecord, CONFIG.FIELDS.TRANSACTION.WAREHOUSE);
     const location = Utils.getFieldValue(transactionRecord, CONFIG.FIELDS.TRANSACTION.LOCATION);
@@ -220,6 +220,11 @@
 
       Utils.log(`✅ 在庫更新完了: ${itemCode} - 在庫数: ${newQty}, 平均単価: ${newCost}, 状態: ${alertFlag}`);
 
+      // 処理フラグを「処理済み」に更新
+      if (transactionRecordId) {
+        await markRecordAsProcessed(transactionRecordId);
+      }
+
       // アラート表示
       if (alertFlag === CONFIG.ALERT_FLAGS.OUT_OF_STOCK) {
         Utils.showAlert('⚠️ 在庫切れが発生しました', 'error');
@@ -231,6 +236,29 @@
       Utils.error('在庫更新エラー:', error);
       Utils.showAlert('在庫更新に失敗しました: ' + error.message, 'error');
       throw error;
+    }
+  }
+
+  /**
+   * 処理フラグを「処理済ぽ」に更新
+   */
+  async function markRecordAsProcessed(recordId) {
+    try {
+      await kintone.api(
+        kintone.api.url('/k/v1/record', true),
+        'PUT',
+        {
+          app: CONFIG.APP_IDS.INVENTORY_TRANSACTION,
+          id: recordId,
+          record: {
+            [CONFIG.FIELDS.TRANSACTION.PROCESSED_FLAG]: { value: ['処理済み'] }
+          }
+        }
+      );
+      Utils.log(`処理フラグを「処理済み」に更新: レコードID ${recordId}`);
+    } catch (error) {
+      Utils.warn('処理フラグ更新エラー:', error);
+      // エラーが出ても在庫更新自体は成功しているので、エラーを投げない
     }
   }
 
@@ -272,7 +300,7 @@
     // ステータスが「確定」の場合のみ在庫更新
     if (status === CONFIG.STATUSES.CONFIRMED) {
       try {
-        await updateInventoryBalance(record);
+        await updateInventoryBalance(record, record.$id.value);
       } catch (error) {
         Utils.error('在庫更新処理でエラーが発生しました:', error);
       }
@@ -295,7 +323,7 @@
     // ステータスが「確定」の場合のみ在庫更新
     if (status === CONFIG.STATUSES.CONFIRMED) {
       try {
-        await updateInventoryBalance(record);
+        await updateInventoryBalance(record, record.$id.value);
       } catch (error) {
         Utils.error('在庫更新処理でエラーが発生しました:', error);
       }
