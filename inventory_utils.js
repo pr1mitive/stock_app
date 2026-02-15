@@ -520,7 +520,7 @@
   // =====================================================
   // グローバル公開
   // =====================================================
-  window.INVENTORY_UTILS = {
+  window.InventoryUtils = {
     // 日付・時刻
     formatDate: formatDate,
     getToday: getToday,
@@ -562,6 +562,8 @@
     isPositive: isPositive
   };
 
-  log('Utils loaded - Version: ' + CONFIG.VERSION);
+  window.InventoryUtils.VERSION = '2.0';
+  
+  log('Utils loaded - Version: 2.0');
 
 })(kintone.$PLUGIN_ID);
