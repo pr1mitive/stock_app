@@ -1,6 +1,6 @@
 /**
  * 在庫取引一括更新スクリプト (Inventory Batch Update Script)
- * バージョン: 2.2
+ * バージョン: 2.3
  * 作成日: 2026-02-17
  * 
  * 【機能概要】
@@ -9,9 +9,9 @@
  * 【処理仕様】
  * 1. 在庫取引アプリ(760)の未処理レコード(processed_flag=OFF)を取得
  * 2. 取引コード (transaction_id) が未設定のレコードに自動採番
- * 3. 品目・倉庫・ロケーション別にグループ化
- * 4. 各グループごとに在庫残高(761)と在庫推移サマリー(762)を更新
- * 5. 発注番号が存在するレコードは発注管理(748)の received_qty を更新
+ * 3. 品目・倉庫・ロケーション別にグループ化して在庫残高を更新
+ * 4. 在庫推移サマリーを全レコードから再集計して更新
+ * 5. 発注番号が存在するレコードは発注管理の received_qty を全レコードから再集計して更新
  * 6. 処理済みレコードの processed_flag を ON に更新
  * 7. 進捗状況をリアルタイム表示
  * 
@@ -52,7 +52,7 @@
    * 一括更新メイン処理
    */
   async function batchUpdateInventory() {
-    UTILS.log('=== 在庫一括更新開始 (v2.1) ===');
+    UTILS.log('=== 在庫一括更新開始 (v2.3) ===');
     
     try {
       // 1. 未処理レコード取得
@@ -80,22 +80,13 @@
       let errorCount = 0;
       const errors = [];
 
-      // 5. グループごとに処理
+      // 5. グループごとに在庫残高を更新
       for (const [key, records] of Object.entries(groups)) {
         try {
           UTILS.log(`処理中: ${key} (${records.length}件)`);
           
           // 在庫残高更新
           await updateBalanceForGroup(records);
-          
-          // 在庫推移サマリー更新
-          await updateProjectionForGroup(records);
-          
-          // 発注残数更新 (発注番号が存在するレコードのみ)
-          await updatePOReceivedQty(records);
-          
-          // 処理済みフラグ更新
-          await markRecordsAsProcessed(records.map(r => r.$id.value));
           
           processedCount += records.length;
           
@@ -112,7 +103,18 @@
         await UTILS.sleep(BATCH_CONFIG.DELAY);
       }
 
-      // 6. 結果表示
+      // 6. 在庫推移サマリーを全レコードから再集計
+      UTILS.log('=== 在庫推移サマリー再集計開始 ===');
+      await updateAllProjections();
+
+      // 7. 発注残数を全レコードから再集計
+      UTILS.log('=== 発注残数再集計開始 ===');
+      await updateAllPOReceivedQty();
+
+      // 8. 処理済みフラグ更新
+      await markRecordsAsProcessed(recordsWithIds.map(r => r.$id.value));
+
+      // 9. 結果表示
       hideProgressBar();
       showResultSummary(processedCount, errorCount, errors);
 
@@ -317,215 +319,229 @@
   }
 
   /**
-   * グループの在庫推移サマリーを更新
+   * 在庫推移サマリーを全レコードから再集計
    */
-  async function updateProjectionForGroup(records) {
-    if (records.length === 0) return;
-
-    const firstRecord = records[0];
-    const itemCode = UTILS.getFieldValue(firstRecord, FIELDS.ITEM_CODE);
-    const warehouse = UTILS.getFieldValue(firstRecord, FIELDS.WAREHOUSE);
-    const location = UTILS.getFieldValue(firstRecord, FIELDS.LOCATION);
-
-    // 確定済みレコードのみを集計
-    const confirmedRecords = records.filter(r => 
-      UTILS.getFieldValue(r, FIELDS.STATUS) === '確定'
-    );
-
-    if (confirmedRecords.length === 0) {
-      UTILS.log(`確定済みレコードなし(サマリー): ${itemCode}-${warehouse}-${location}`);
-      return;
-    }
-
-    // 取引日ごとにグループ化
-    const dailyTransactions = {};
-    
-    confirmedRecords.forEach(record => {
-      const date = UTILS.getFieldValue(record, FIELDS.TRANSACTION_DATE);
-      const transactionType = UTILS.getFieldValue(record, FIELDS.TRANSACTION_TYPE);
-      const quantity = UTILS.getNumberValue(record, FIELDS.QUANTITY);
+  async function updateAllProjections() {
+    try {
+      // 在庫取引アプリから全ての確定済みレコードを取得
+      const query = `${FIELDS.STATUS} = "確定" order by ${FIELDS.TRANSACTION_DATE} asc limit 500`;
+      UTILS.log(`[サマリー] クエリ: ${query}`);
       
-      if (!date) return;
-      
-      if (!dailyTransactions[date]) {
-        dailyTransactions[date] = {
-          receivedQty: 0,
-          issuedQty: 0
-        };
+      const resp = await kintone.api(kintone.api.url('/k/v1/records', true), 'GET', {
+        app: APP_IDS.INVENTORY_TRANSACTION,
+        query: query
+      });
+
+      const allRecords = resp.records || [];
+      UTILS.log(`[サマリー] 確定済みレコード数: ${allRecords.length}件`);
+
+      if (allRecords.length === 0) {
+        UTILS.log('[サマリー] 確定済みレコードなし');
+        return;
       }
-      
-      if (transactionType === '入庫' || transactionType === '初期在庫') {
-        dailyTransactions[date].receivedQty += quantity;
-      } else if (transactionType === '出庫') {
-        dailyTransactions[date].issuedQty += quantity;
-      }
-    });
 
-    // 各日付のサマリーレコードを更新
-    for (const [date, quantities] of Object.entries(dailyTransactions)) {
-      const summaryId = `SUM-${date}-${itemCode}-${warehouse}-${location}`;
-      
-      try {
-        // 既存サマリーレコード取得
-        let summaryRecord = await getProjectionRecord(summaryId);
-        
-        if (summaryRecord) {
-          // 更新
-          const updateData = {
-            [CONFIG.FIELDS.PROJECTION.ACTUAL_RECEIVED_QTY]: { 
-              value: (UTILS.getNumberValue(summaryRecord, CONFIG.FIELDS.PROJECTION.ACTUAL_RECEIVED_QTY) || 0) + quantities.receivedQty
-            },
-            [CONFIG.FIELDS.PROJECTION.ACTUAL_ISSUED_QTY]: { 
-              value: (UTILS.getNumberValue(summaryRecord, CONFIG.FIELDS.PROJECTION.ACTUAL_ISSUED_QTY) || 0) + quantities.issuedQty
-            }
+      // 日付 + 品目 + 倉庫 + ロケーション別にグループ化
+      const dailyGroups = {};
+
+      allRecords.forEach(record => {
+        const date = UTILS.getFieldValue(record, FIELDS.TRANSACTION_DATE);
+        const itemCode = UTILS.getFieldValue(record, FIELDS.ITEM_CODE);
+        const warehouse = UTILS.getFieldValue(record, FIELDS.WAREHOUSE);
+        const location = UTILS.getFieldValue(record, FIELDS.LOCATION);
+        const transactionType = UTILS.getFieldValue(record, FIELDS.TRANSACTION_TYPE);
+        const quantity = UTILS.getNumberValue(record, FIELDS.QUANTITY);
+
+        if (!date || !itemCode || !warehouse || !location) return;
+
+        const key = `${date}-${itemCode}-${warehouse}-${location}`;
+
+        if (!dailyGroups[key]) {
+          dailyGroups[key] = {
+            date,
+            itemCode,
+            warehouse,
+            location,
+            receivedQty: 0,
+            issuedQty: 0
           };
+        }
+
+        if (transactionType === '入庫' || transactionType === '初期在庫') {
+          dailyGroups[key].receivedQty += quantity;
+        } else if (transactionType === '出庫') {
+          dailyGroups[key].issuedQty += quantity;
+        }
+      });
+
+      UTILS.log(`[サマリー] 日別グループ数: ${Object.keys(dailyGroups).length}`);
+
+      // 各グループのサマリーレコードを更新
+      let updateCount = 0;
+      for (const [key, data] of Object.entries(dailyGroups)) {
+        try {
+          const summaryId = `SUM-${data.date}-${data.itemCode}-${data.warehouse}-${data.location}`;
           
-          // ending_qty を再計算
-          const beginningQty = UTILS.getNumberValue(summaryRecord, CONFIG.FIELDS.PROJECTION.BEGINNING_QTY) || 0;
-          const actualReceivedQty = updateData[CONFIG.FIELDS.PROJECTION.ACTUAL_RECEIVED_QTY].value;
-          const actualIssuedQty = updateData[CONFIG.FIELDS.PROJECTION.ACTUAL_ISSUED_QTY].value;
+          // 既存サマリーレコード取得
+          let summaryRecord = await getProjectionRecord(summaryId);
           
-          updateData[CONFIG.FIELDS.PROJECTION.ENDING_QTY] = { 
-            value: beginningQty + actualReceivedQty - actualIssuedQty
-          };
+          if (summaryRecord) {
+            // 更新
+            const updateData = {
+              [CONFIG.FIELDS.PROJECTION.ACTUAL_RECEIVED_QTY]: { value: data.receivedQty },
+              [CONFIG.FIELDS.PROJECTION.ACTUAL_ISSUED_QTY]: { value: data.issuedQty }
+            };
+            
+            // ending_qty を再計算
+            const beginningQty = UTILS.getNumberValue(summaryRecord, CONFIG.FIELDS.PROJECTION.BEGINNING_QTY) || 0;
+            updateData[CONFIG.FIELDS.PROJECTION.ENDING_QTY] = { 
+              value: beginningQty + data.receivedQty - data.issuedQty
+            };
+            
+            await updateProjectionRecord(summaryRecord.$id.value, updateData);
+            
+          } else {
+            // 新規作成
+            const createData = {
+              [CONFIG.FIELDS.PROJECTION.SUMMARY_ID]: { value: summaryId },
+              [CONFIG.FIELDS.PROJECTION.SUMMARY_DATE]: { value: data.date },
+              [CONFIG.FIELDS.PROJECTION.ITEM_CODE]: { value: data.itemCode },
+              [CONFIG.FIELDS.PROJECTION.WAREHOUSE]: { value: data.warehouse },
+              [CONFIG.FIELDS.PROJECTION.LOCATION]: { value: data.location },
+              [CONFIG.FIELDS.PROJECTION.BEGINNING_QTY]: { value: 0 },
+              [CONFIG.FIELDS.PROJECTION.ACTUAL_RECEIVED_QTY]: { value: data.receivedQty },
+              [CONFIG.FIELDS.PROJECTION.ACTUAL_ISSUED_QTY]: { value: data.issuedQty },
+              [CONFIG.FIELDS.PROJECTION.ENDING_QTY]: { value: data.receivedQty - data.issuedQty }
+            };
+            
+            await createProjectionRecord(createData);
+          }
           
-          await updateProjectionRecord(summaryRecord.$id.value, updateData);
+          updateCount++;
           
-        } else {
-          // 新規作成
-          const createData = {
-            [CONFIG.FIELDS.PROJECTION.SUMMARY_ID]: { value: summaryId },
-            [CONFIG.FIELDS.PROJECTION.SUMMARY_DATE]: { value: date },
-            [CONFIG.FIELDS.PROJECTION.ITEM_CODE]: { value: itemCode },
-            [CONFIG.FIELDS.PROJECTION.WAREHOUSE]: { value: warehouse },
-            [CONFIG.FIELDS.PROJECTION.LOCATION]: { value: location },
-            [CONFIG.FIELDS.PROJECTION.BEGINNING_QTY]: { value: 0 },
-            [CONFIG.FIELDS.PROJECTION.ACTUAL_RECEIVED_QTY]: { value: quantities.receivedQty },
-            [CONFIG.FIELDS.PROJECTION.ACTUAL_ISSUED_QTY]: { value: quantities.issuedQty },
-            [CONFIG.FIELDS.PROJECTION.ENDING_QTY]: { value: quantities.receivedQty - quantities.issuedQty }
-          };
-          
-          await createProjectionRecord(createData);
+        } catch (error) {
+          UTILS.error(`[サマリー] 更新エラー (${key}):`, error);
         }
         
-      } catch (error) {
-        UTILS.error(`サマリー更新エラー (${summaryId}):`, error);
+        await UTILS.sleep(BATCH_CONFIG.DELAY);
       }
-    }
 
-    UTILS.log(`在庫推移サマリー更新完了: ${itemCode}-${warehouse}-${location}`);
+      UTILS.log(`[サマリー] 在庫推移サマリー更新完了: ${updateCount}件`);
+
+    } catch (error) {
+      UTILS.error('[サマリー] 在庫推移サマリー再集計エラー:', error);
+      throw error;
+    }
   }
 
   /**
-   * 発注残数 (received_qty) を更新
-   * ※ 在庫取引アプリ全体から該当発注の入庫済み数量を再集計
+   * 発注残数を全レコードから再集計
    */
-  async function updatePOReceivedQty(records) {
-    // 発注番号が存在するレコードのみ
-    const poRecords = records.filter(r => {
-      const poNumber = UTILS.getFieldValue(r, FIELDS.PO_NUMBER);
-      const transactionType = UTILS.getFieldValue(r, FIELDS.TRANSACTION_TYPE);
-      const status = UTILS.getFieldValue(r, FIELDS.STATUS);
+  async function updateAllPOReceivedQty() {
+    try {
+      // 在庫取引アプリから発注番号付きの全入庫レコードを取得
+      const query = `${FIELDS.PO_NUMBER} != "" and ${FIELDS.TRANSACTION_TYPE} = "入庫" and ${FIELDS.STATUS} = "確定" limit 500`;
+      UTILS.log(`[PO更新] クエリ: ${query}`);
       
-      return poNumber && transactionType === '入庫' && status === '確定';
-    });
+      const resp = await kintone.api(kintone.api.url('/k/v1/records', true), 'GET', {
+        app: APP_IDS.INVENTORY_TRANSACTION,
+        query: query
+      });
 
-    if (poRecords.length === 0) {
-      UTILS.log('[PO更新] 発注番号付き入庫レコードなし');
-      return;
-    }
+      const allPORecords = resp.records || [];
+      UTILS.log(`[PO更新] 発注番号付き入庫レコード数: ${allPORecords.length}件`);
 
-    // ユニークな発注番号を抽出
-    const uniquePONumbers = [...new Set(poRecords.map(r => 
-      UTILS.getFieldValue(r, FIELDS.PO_NUMBER)
-    ))];
-
-    UTILS.log(`[PO更新] 対象発注番号: ${uniquePONumbers.join(', ')}`);
-
-    // 各発注番号ごとに処理
-    for (const poNumber of uniquePONumbers) {
-      try {
-        UTILS.log(`[PO更新] 発注番号 ${poNumber} の処理開始`);
-        
-        // 1. 発注レコード取得
-        const poRecord = await getPORecord(poNumber);
-        
-        if (!poRecord) {
-          UTILS.warn(`[PO更新] 発注レコードが見つかりません: ${poNumber}`);
-          continue;
-        }
-
-        // 2. 該当発注のすべての入庫レコードを在庫取引アプリから取得
-        const query = `${FIELDS.PO_NUMBER} = "${poNumber}" and ${FIELDS.TRANSACTION_TYPE} = "入庫" and ${FIELDS.STATUS} = "確定"`;
-        UTILS.log(`[PO更新] クエリ: ${query}`);
-        
-        const transactionResp = await kintone.api(kintone.api.url('/k/v1/records', true), 'GET', {
-          app: APP_IDS.INVENTORY_TRANSACTION,
-          query: query
-        });
-        
-        const allTransactions = transactionResp.records || [];
-        UTILS.log(`[PO更新] 発注 ${poNumber} の入庫レコード数: ${allTransactions.length}件`);
-
-        // 3. 品目コードごとに入庫数量を集計
-        const itemTotals = {};
-        
-        allTransactions.forEach(record => {
-          const itemCode = UTILS.getFieldValue(record, FIELDS.ITEM_CODE);
-          const quantity = UTILS.getNumberValue(record, FIELDS.QUANTITY);
-          
-          if (!itemTotals[itemCode]) {
-            itemTotals[itemCode] = 0;
-          }
-          
-          itemTotals[itemCode] += quantity;
-        });
-
-        UTILS.log(`[PO更新] 品目別集計結果:`, itemTotals);
-
-        // 4. po_items テーブルを更新
-        const poItems = UTILS.getFieldValue(poRecord, PO_FIELDS.PO_ITEMS) || [];
-        let updated = false;
-        
-        poItems.forEach(item => {
-          const itemCode = UTILS.getFieldValue(item.value, CONFIG.FIELDS.PO_ITEM.ITEM_CODE);
-          
-          if (itemTotals[itemCode] !== undefined) {
-            const totalReceivedQty = itemTotals[itemCode];
-            const currentReceivedQty = UTILS.getNumberValue(item.value, CONFIG.FIELDS.PO_ITEM.RECEIVED_QTY) || 0;
-            
-            // received_qty を全体の合計値で上書き
-            item.value[CONFIG.FIELDS.PO_ITEM.RECEIVED_QTY] = { value: totalReceivedQty };
-            
-            UTILS.log(`[PO更新] ${itemCode}: ${currentReceivedQty} → ${totalReceivedQty}`);
-            updated = true;
-          }
-        });
-
-        if (!updated) {
-          UTILS.log(`[PO更新] 発注 ${poNumber} に更新対象品目なし`);
-          continue;
-        }
-
-        // 5. 発注レコードを更新
-        UTILS.log(`[PO更新] 発注レコード更新開始: ${poNumber}`);
-        
-        await kintone.api(kintone.api.url('/k/v1/record', true), 'PUT', {
-          app: APP_IDS.PO_MANAGEMENT,
-          id: poRecord.$id.value,
-          record: {
-            [PO_FIELDS.PO_ITEMS]: { value: poItems.map(item => item.value) }
-          }
-        });
-
-        UTILS.log(`[PO更新] 発注残数更新完了: ${poNumber}`);
-
-      } catch (error) {
-        UTILS.error(`[PO更新] 発注残数更新エラー (${poNumber}):`, error);
-        UTILS.error(`[PO更新] エラー詳細:`, error.message, error.stack);
+      if (allPORecords.length === 0) {
+        UTILS.log('[PO更新] 発注番号付き入庫レコードなし');
+        return;
       }
-      
-      await UTILS.sleep(BATCH_CONFIG.DELAY);
+
+      // 発注番号ごとにグループ化
+      const poGroups = {};
+
+      allPORecords.forEach(record => {
+        const poNumber = UTILS.getFieldValue(record, FIELDS.PO_NUMBER);
+        const itemCode = UTILS.getFieldValue(record, FIELDS.ITEM_CODE);
+        const quantity = UTILS.getNumberValue(record, FIELDS.QUANTITY);
+
+        if (!poGroups[poNumber]) {
+          poGroups[poNumber] = {};
+        }
+
+        if (!poGroups[poNumber][itemCode]) {
+          poGroups[poNumber][itemCode] = 0;
+        }
+
+        poGroups[poNumber][itemCode] += quantity;
+      });
+
+      UTILS.log(`[PO更新] 対象発注番号: ${Object.keys(poGroups).join(', ')}`);
+
+      // 各発注番号ごとに処理
+      let updateCount = 0;
+      for (const [poNumber, itemTotals] of Object.entries(poGroups)) {
+        try {
+          UTILS.log(`[PO更新] 発注番号 ${poNumber} の処理開始`);
+          UTILS.log(`[PO更新] 品目別集計結果:`, itemTotals);
+
+          // 発注レコード取得
+          const poRecord = await getPORecord(poNumber);
+          
+          if (!poRecord) {
+            UTILS.warn(`[PO更新] 発注レコードが見つかりません: ${poNumber}`);
+            continue;
+          }
+
+          // po_items テーブルを更新
+          const poItems = UTILS.getFieldValue(poRecord, PO_FIELDS.PO_ITEMS) || [];
+          let updated = false;
+          
+          poItems.forEach(item => {
+            const itemCode = UTILS.getFieldValue(item.value, CONFIG.FIELDS.PO_ITEM.ITEM_CODE);
+            
+            if (itemTotals[itemCode] !== undefined) {
+              const totalReceivedQty = itemTotals[itemCode];
+              const currentReceivedQty = UTILS.getNumberValue(item.value, CONFIG.FIELDS.PO_ITEM.RECEIVED_QTY) || 0;
+              
+              // received_qty を全体の合計値で上書き
+              item.value[CONFIG.FIELDS.PO_ITEM.RECEIVED_QTY] = { value: totalReceivedQty };
+              
+              UTILS.log(`[PO更新] ${itemCode}: ${currentReceivedQty} → ${totalReceivedQty}`);
+              updated = true;
+            }
+          });
+
+          if (!updated) {
+            UTILS.log(`[PO更新] 発注 ${poNumber} に更新対象品目なし`);
+            continue;
+          }
+
+          // 発注レコードを更新
+          UTILS.log(`[PO更新] 発注レコード更新開始: ${poNumber}`);
+          
+          await kintone.api(kintone.api.url('/k/v1/record', true), 'PUT', {
+            app: APP_IDS.PO_MANAGEMENT,
+            id: poRecord.$id.value,
+            record: {
+              [PO_FIELDS.PO_ITEMS]: { value: poItems.map(item => item.value) }
+            }
+          });
+
+          UTILS.log(`[PO更新] 発注残数更新完了: ${poNumber}`);
+          updateCount++;
+
+        } catch (error) {
+          UTILS.error(`[PO更新] 発注残数更新エラー (${poNumber}):`, error);
+          UTILS.error(`[PO更新] エラー詳細:`, error.message);
+        }
+        
+        await UTILS.sleep(BATCH_CONFIG.DELAY);
+      }
+
+      UTILS.log(`[PO更新] 発注残数更新完了: ${updateCount}件`);
+
+    } catch (error) {
+      UTILS.error('[PO更新] 発注残数再集計エラー:', error);
+      throw error;
     }
   }
 
@@ -957,10 +973,10 @@
 
   // グローバルに公開
   window.InventoryBatchUpdate = {
-    VERSION: '2.1',
+    VERSION: '2.3',
     batchUpdateInventory: batchUpdateInventory
   };
 
-  UTILS.log('[INVENTORY] Batch Update Script loaded - Version: 2.1');
+  UTILS.log('[INVENTORY] Batch Update Script loaded - Version: 2.3');
 
 })();
